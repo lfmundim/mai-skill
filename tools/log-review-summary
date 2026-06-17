@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""log-review-summary — Append a review-loop summary entry to the shared delegate run log.
+
+Called by the /mai orchestrator after the --with-review N loop completes.
+
+Usage:
+  log-review-summary --workdir PATH --allowed N --used N --found N --fixed N --remaining N
+"""
+import json, argparse, os
+from pathlib import Path
+from datetime import datetime, timezone
+
+LOG = Path.home() / '.local' / 'share' / 'delegate-runs.jsonl'
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Append MAI review summary to delegate run log')
+    ap.add_argument('--workdir',   required=True)
+    ap.add_argument('--allowed',   type=int, required=True, help='review_iterations_allowed (N from --with-review N)')
+    ap.add_argument('--used',      type=int, required=True, help='review_iterations_used')
+    ap.add_argument('--found',     type=int, required=True, help='review_issues_found')
+    ap.add_argument('--fixed',     type=int, required=True, help='review_issues_fixed')
+    ap.add_argument('--remaining', type=int, required=True, help='review_issues_remaining')
+    args = ap.parse_args()
+
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+
+    entry = {
+        'ts':                         datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'delegate':                   'copilot',
+        'type':                       'review_summary',
+        'workdir':                    args.workdir,
+        'project':                    os.path.basename(args.workdir.rstrip('/')),
+        'review_iterations_allowed':  args.allowed,
+        'review_iterations_used':     args.used,
+        'review_issues_found':        args.found,
+        'review_issues_fixed':        args.fixed,
+        'review_issues_remaining':    args.remaining,
+    }
+
+    with open(LOG, 'a') as f:
+        f.write(json.dumps(entry) + '\n')
+
+    status = 'clean' if args.remaining == 0 else f'{args.remaining} issue(s) remaining'
+    print(
+        f'[review-log] → {LOG}  '
+        f'({args.used}/{args.allowed} iterations, '
+        f'{args.found} found, {args.fixed} fixed, {status})'
+    )
+
+
+if __name__ == '__main__':
+    main()

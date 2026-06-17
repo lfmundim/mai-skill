@@ -1,0 +1,13 @@
+# Generated files
+/tmp/copilot-prompt-*.txt
+/tmp/copilot-out-*.txt
+/tmp/mai-syntax-count-*.txt
+
+# macOS
+.DS_Store
+
+# Local overrides
+*.local
+
+# Reference copy of upstream vibe-skill (not part of this project)
+vibe-skill-main/

@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# copilot-delegate — Runs Copilot CLI in programmatic mode and captures the result.
+#
+# Usage: copilot-delegate <workdir> <prompt> <model> [timeout-secs] [--verbose]
+#
+# PROMPT SAFETY:
+#   The prompt is written to a temp file and read via $(cat "$PROMPT_FILE") to avoid
+#   shell injection when the prompt contains colons, braces, quotes, Python/JSON code,
+#   accented chars, or emoji.
+#
+# VERSION CHECK:
+#   Copilot CLI auto-updates without deprecation warnings. The script records the CLI
+#   version after every run in ~/.local/share/copilot-delegate-cli-version and warns
+#   if it changed since the last run — a version change may silently break flag names.
+#
+# POLICY DETECTION:
+#   --yolo and --allow-tool may be blocked by enterprise admin policy. The script
+#   checks output and exit code and surfaces the issue clearly if detected.
+#
+# RUN LOG:
+#   Appends one JSONL entry to ~/.local/share/delegate-runs.jsonl after each run.
+#   Fields: ts, delegate, workdir, project, executor_model, executor_model_fallback,
+#           exit_code, timed_out, files_changed, syntax_errors, duration_secs,
+#           tokens_in, tokens_out, cost_aic.
+
+POSITIONAL=()
+VERBOSE=false
+for arg in "$@"; do
+  case "$arg" in
+    --verbose|-v) VERBOSE=true ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
+
+WORKDIR="${1:?Usage: copilot-delegate <workdir> <prompt> <model> [timeout-secs] [--verbose]}"
+PROMPT="${2:?Prompt required}"
+MODEL="${3:-gpt-5-mini}"   # default fallback when orchestrator omits model
+TIMEOUT_SECS="${4:-300}"
+
+# Also respect env var (set by SKILL.md orchestrator when user passes --verbose)
+if [ "${DELEGATE_VERBOSE:-false}" = "true" ]; then VERBOSE=true; fi
+
+if [ ! -d "$WORKDIR" ]; then
+  echo "ERROR: workdir '$WORKDIR' does not exist" >&2
+  exit 1
+fi
+
+if [ -z "$MODEL" ]; then
+  MODEL="gpt-5-mini"
+  echo "[warn] No model specified — defaulting to gpt-5-mini"
+fi
+
+# ── CLI version check ─────────────────────────────────────────────────────────
+CURRENT_VERSION=$(copilot --version 2>/dev/null | head -1)
+VERSION_FILE="$HOME/.local/share/copilot-delegate-cli-version"
+mkdir -p "$(dirname "$VERSION_FILE")"
+if [ -f "$VERSION_FILE" ]; then
+  STORED_VERSION=$(cat "$VERSION_FILE")
+  if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" != "$STORED_VERSION" ]; then
+    echo "[WARN] Copilot CLI version changed: $STORED_VERSION → $CURRENT_VERSION"
+    echo "       Verify --allow-tool and --yolo flags still work — names may have changed."
+  fi
+fi
+[ -n "$CURRENT_VERSION" ] && echo "$CURRENT_VERSION" > "$VERSION_FILE"
+
+# ── Detect if this model is a fallback (set by orchestrator via env var) ───────
+MODEL_FALLBACK="${DELEGATE_MODEL_FALLBACK:-false}"
+
+cd "$WORKDIR"
+START_NS=$(date +%s%N)
+GIT_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "no-git")
+FILES_BEFORE=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+
+# ── OTel file exporter — captures real AIC and token counts ───────────────────
+OTEL_FILE=$(mktemp /tmp/copilot-otel-XXXXXX.jsonl)
+export COPILOT_OTEL_FILE_EXPORTER_PATH="$OTEL_FILE"
+
+echo "=== MAI-DELEGATE START ==="
+echo "Workdir : $WORKDIR"
+if [ "$MODEL_FALLBACK" = "true" ]; then
+  echo "Model   : $MODEL  (fallback — MAI-Code-1-Flash not available)"
+else
+  echo "Model   : $MODEL"
+fi
+echo "Timeout : ${TIMEOUT_SECS}s"
+echo "Prompt  : ${PROMPT:0:120}..."
+echo "=========================="
+
+# ── Write prompt to temp file (avoids shell injection with special chars) ──────
+PROMPT_FILE=$(mktemp /tmp/copilot-prompt-XXXXXX.txt)
+OUTPUT_FILE=$(mktemp /tmp/copilot-out-XXXXXX.txt)
+trap 'rm -f "$PROMPT_FILE" "$OUTPUT_FILE" "$OTEL_FILE"' EXIT
+printf '%s' "$PROMPT" > "$PROMPT_FILE"
+
+# ── Run Copilot CLI ────────────────────────────────────────────────────────────
+# Streams output live while also capturing it for post-run policy detection.
+# No pseudo-TTY needed — Copilot CLI works without one in programmatic mode.
+timeout "$TIMEOUT_SECS" copilot -p "$(cat "$PROMPT_FILE")" \
+  --model "$MODEL" \
+  --allow-tool='write,shell' \
+  --yolo \
+  2>&1 | tee "$OUTPUT_FILE"
+COPILOT_EXIT=${PIPESTATUS[0]}
+
+# ── Model-not-found cascade ───────────────────────────────────────────────────
+MODEL_NOT_FOUND_PATTERN="model not found|unknown model|invalid model|model.*not available|no such model|model.*not supported"
+if grep -qiE "$MODEL_NOT_FOUND_PATTERN" "$OUTPUT_FILE" 2>/dev/null; then
+  if [ "$MODEL" != "gpt-5-mini" ]; then
+    echo ""
+    echo "[warn] Model '$MODEL' not available — retrying with gpt-5-mini"
+    MODEL="gpt-5-mini"
+    MODEL_FALLBACK=true
+    > "$OUTPUT_FILE"
+    timeout "$TIMEOUT_SECS" copilot -p "$(cat "$PROMPT_FILE")" \
+      --model "$MODEL" \
+      --allow-all-tools \
+      --yolo \
+      2>&1 | tee "$OUTPUT_FILE"
+    COPILOT_EXIT=${PIPESTATUS[0]}
+    if grep -qiE "$MODEL_NOT_FOUND_PATTERN" "$OUTPUT_FILE" 2>/dev/null; then
+      echo ""
+      echo "⚠ Neither MAI-Code-1-Flash nor gpt-5-mini were available. Delegation aborted."
+      echo "  Override permanently: /mai-model-pick <alias>"
+      exit 1
+    fi
+  else
+    echo ""
+    echo "⚠ Neither MAI-Code-1-Flash nor gpt-5-mini were available. Delegation aborted."
+    echo "  Override permanently: /mai-model-pick <alias>"
+    exit 1
+  fi
+fi
+
+echo ""
+
+# ── Policy / permission detection ─────────────────────────────────────────────
+if grep -qiE "admin policy|not permitted|tool.{0,20}blocked|blocked by.{0,20}policy|permission denied|tool.*not allowed|yolo.*not allowed|allow-tool.*not allowed" "$OUTPUT_FILE" 2>/dev/null; then
+  echo "[ERROR] Enterprise admin policy is blocking --yolo or --allow-tool."
+  echo "        These flags require explicit permission in managed Copilot environments."
+  echo "        Action: contact your administrator, or check your organization's Copilot policy settings."
+  echo "        Workaround: run copilot interactively (without --yolo) and approve each tool call manually."
+fi
+
+if [ "$COPILOT_EXIT" -eq 124 ]; then
+  echo "=== MAI-DELEGATE TIMEOUT (>${TIMEOUT_SECS}s) — killed ==="
+else
+  echo "=== MAI-DELEGATE DONE (exit: $COPILOT_EXIT) ==="
+fi
+
+# ── Post-run syntax checks ────────────────────────────────────────────────────
+FILES_AFTER=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+CHANGED=$(comm -13 <(echo "$FILES_BEFORE" | sort) <(echo "$FILES_AFTER" | sort) 2>/dev/null)
+
+SYNTAX_COUNT_FILE=$(mktemp /tmp/mai-syntax-count-XXXXXX.txt)
+echo 0 > "$SYNTAX_COUNT_FILE"
+export DELEGATE_CHANGED="$CHANGED"
+export SYNTAX_COUNT_FILE
+
+python3 << 'PYSYNTAX'
+import os, shutil, subprocess
+
+changed = [f for f in os.environ.get('DELEGATE_CHANGED', '').splitlines() if f.strip()]
+errors  = 0
+checked = 0
+
+def has(cmd):
+    return shutil.which(cmd) is not None
+
+def check(cmd, label, cwd=None):
+    global errors, checked
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    checked += 1
+    if r.returncode != 0:
+        errors += 1
+        msg = (r.stderr or r.stdout).strip().split('\n')[0][:120]
+        print(f'  [SYNTAX ERROR] {label}: {msg}')
+
+for f in changed:
+    if not os.path.isfile(f):
+        continue
+    if f.endswith('.py'):
+        check(['python3', '-m', 'py_compile', f], f)
+    elif f.endswith(('.js', '.mjs', '.cjs')) and has('node'):
+        check(['node', '--check', f], f)
+    elif f.endswith('.cs') and has('dotnet'):
+        # For C# we can only do a project-level check; defer to project check below
+        pass
+    elif f.endswith('.swift') and has('swiftc'):
+        check(['swiftc', '-typecheck', f], f)
+    elif f.endswith('.rs'):
+        pass  # Rust: check at project level below
+
+live = [f for f in changed if os.path.isfile(f)]
+if any(f.endswith('.go') for f in live) and has('go'):
+    check(['go', 'vet', './...'], 'go vet')
+if any(f.endswith('.rs') for f in live) and has('cargo'):
+    check(['cargo', 'check', '--quiet'], 'cargo check')
+if any(f.endswith('.cs') for f in live) and has('dotnet'):
+    check(['dotnet', 'build', '--no-restore', '-v', 'q'], 'dotnet build')
+if any(f.endswith(('.ts', '.tsx')) for f in live):
+    if has('tsc') and os.path.isfile('tsconfig.json'):
+        check(['tsc', '--noEmit', '--skipLibCheck'], 'tsc --noEmit')
+
+if checked > 0:
+    if errors == 0:
+        print(f'=== SYNTAX OK ({checked} check(s)) ===')
+    else:
+        print(f'=== SYNTAX ERRORS: {errors} in {checked} check(s) — fix before committing ===')
+
+cf = os.environ.get('SYNTAX_COUNT_FILE', '')
+if cf:
+    with open(cf, 'w') as fh:
+        fh.write(str(errors))
+PYSYNTAX
+
+TOTAL_ERRORS=$(cat "$SYNTAX_COUNT_FILE" 2>/dev/null || echo 0)
+rm -f "$SYNTAX_COUNT_FILE"
+
+# ── Git summary ───────────────────────────────────────────────────────────────
+GIT_AFTER=$(git rev-parse HEAD 2>/dev/null || echo "no-git")
+
+if [ "$GIT_BEFORE" != "$GIT_AFTER" ]; then
+  echo ""
+  echo "=== COMMITS CREATED ==="
+  git log "$GIT_BEFORE".."$GIT_AFTER" --oneline
+  echo ""
+  echo "=== DIFF STAT ==="
+  git diff "$GIT_BEFORE".."$GIT_AFTER" --stat
+else
+  echo ""
+  echo "=== UNCOMMITTED CHANGES ==="
+  git diff --stat -- "$WORKDIR" 2>/dev/null || echo "(no git)"
+  git status --short -- "$WORKDIR" 2>/dev/null
+fi
+
+# ── AIC report + run log (via OTel) ──────────────────────────────────────────
+END_NS=$(date +%s%N)
+FILES_CHANGED_COUNT=$(printf '%s\n' "$CHANGED" | grep -c '[^[:space:]]' 2>/dev/null)
+FILES_CHANGED_COUNT=${FILES_CHANGED_COUNT:-0}
+TOTAL_ERRORS=${TOTAL_ERRORS:-0}
+
+export DELEGATE_WORKDIR="$WORKDIR"
+export DELEGATE_EXIT="$COPILOT_EXIT"
+export DELEGATE_TIMEOUT="$TIMEOUT_SECS"
+export DELEGATE_MODEL="$MODEL"
+export DELEGATE_MODEL_FALLBACK="$MODEL_FALLBACK"
+export DELEGATE_FILES_CHANGED="$FILES_CHANGED_COUNT"
+export DELEGATE_SYNTAX_ERRORS="$TOTAL_ERRORS"
+export DELEGATE_START_NS="$START_NS"
+export DELEGATE_END_NS="$END_NS"
+export DELEGATE_OTEL_FILE="$OTEL_FILE"
+
+python3 << 'PYLOG'
+import json, os
+from pathlib import Path
+from datetime import datetime, timezone
+
+LOG      = Path.home() / '.local' / 'share' / 'delegate-runs.jsonl'
+LOG.parent.mkdir(parents=True, exist_ok=True)
+verbose  = os.environ.get('VERBOSE', 'false').lower() == 'true'
+
+start_ns = int(os.environ.get('DELEGATE_START_NS', 0) or 0)
+end_ns   = int(os.environ.get('DELEGATE_END_NS',   0) or 0)
+duration = round((end_ns - start_ns) / 1e9, 1) if start_ns and end_ns else 0
+
+exit_code     = int(os.environ.get('DELEGATE_EXIT', 0) or 0)
+timed_out     = exit_code == 124
+files_changed = int(os.environ.get('DELEGATE_FILES_CHANGED', 0) or 0)
+syntax_errors = int(os.environ.get('DELEGATE_SYNTAX_ERRORS', 0) or 0)
+workdir       = os.environ.get('DELEGATE_WORKDIR', '')
+model         = os.environ.get('DELEGATE_MODEL', '')
+fallback      = os.environ.get('DELEGATE_MODEL_FALLBACK', 'false').lower() == 'true'
+otel_file     = os.environ.get('DELEGATE_OTEL_FILE', '')
+
+# ── Parse OTel for real AIC + token counts ────────────────────────────────────
+tokens_in = tokens_out = tokens_cached = tokens_reasoning = 0
+cost_aic  = 0.0
+
+if otel_file:
+    try:
+        for line in Path(otel_file).read_text(errors='replace').splitlines():
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # Use the top-level invoke_agent span — it carries aggregated totals
+            if obj.get('type') == 'span' and obj.get('name', '').startswith('invoke_agent'):
+                attrs = obj.get('attributes', {})
+                tokens_in        = attrs.get('gen_ai.usage.input_tokens', 0)
+                tokens_out       = attrs.get('gen_ai.usage.output_tokens', 0)
+                tokens_cached    = attrs.get('gen_ai.usage.cache_read_input_tokens', 0)
+                tokens_reasoning = attrs.get('gen_ai.usage.reasoning_output_tokens', 0)
+                nano_aiu         = attrs.get('github.copilot.nano_aiu', 0)
+                cost_aic         = round(nano_aiu / 1e9, 4) if nano_aiu else 0.0
+                break
+    except Exception:
+        pass
+
+# ── Print AIC summary ─────────────────────────────────────────────────────────
+if cost_aic > 0 or tokens_in > 0:
+    if verbose:
+        print(f'[aic] {cost_aic:.4f} AIC')
+        print(f'      ↑ {tokens_in:,} tok ({tokens_cached:,} cached) • ↓ {tokens_out:,} tok', end='')
+        if tokens_reasoning:
+            print(f' ({tokens_reasoning:,} reasoning)', end='')
+        print()
+    else:
+        reasoning_str = f' ({tokens_reasoning:,} reasoning)' if tokens_reasoning else ''
+        print(f'[aic] {cost_aic:.4f} AIC  |  ↑{tokens_in:,} ({tokens_cached:,} cached) • ↓{tokens_out:,}{reasoning_str}')
+else:
+    print('[aic] OTel data not available — AIC unknown')
+
+# ── Failure reason ────────────────────────────────────────────────────────────
+if timed_out:
+    reason = 'timeout'
+elif exit_code not in (0, 124):
+    reason = 'exit_error'
+elif syntax_errors > 0:
+    reason = 'syntax_error'
+elif files_changed == 0 and exit_code == 0:
+    reason = 'wrote_nothing'
+else:
+    reason = 'ok'
+
+entry = {
+    'ts':                      datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'delegate':                'copilot',
+    'workdir':                 workdir,
+    'project':                 os.path.basename(workdir.rstrip('/')),
+    'executor_model':          model,
+    'executor_model_fallback': fallback,
+    'exit_code':               exit_code,
+    'timed_out':               timed_out,
+    'files_changed':           files_changed,
+    'syntax_errors':           syntax_errors,
+    'duration_secs':           duration,
+    'tokens_in':               tokens_in,
+    'tokens_out':              tokens_out,
+    'tokens_cached':           tokens_cached,
+    'tokens_reasoning':        tokens_reasoning,
+    'cost_aic':                cost_aic,
+    'failure_reason':          reason,
+    'wrote_nothing':           reason in ('wrote_nothing', 'silent_exit', 'near_empty'),
+}
+
+with open(LOG, 'a') as f:
+    f.write(json.dumps(entry) + '\n')
+
+reason_str = f'  {reason}' if reason != 'ok' else ''
+print(f'[log] → {LOG}  (exit {exit_code}, {duration}s, {cost_aic:.4f} AIC{reason_str})')
+PYLOG
+
+exit $COPILOT_EXIT
