@@ -230,11 +230,7 @@ directly into bash heredocs yourself.
 ~/tools/copilot-delegate "/path/to/project" "Stack: Python/Flask. File: app.py\n\nTASK: Add rate limiting..." "gpt-5-mini" 300
 ```
 
-**Background launch:**
-```bash
-~/tools/copilot-delegate "/path/to/project" "<prompt>" "gpt-5-mini" > /tmp/mai_out.txt 2>&1 &
-# Monitor with: tail -f /tmp/mai_out.txt
-```
+Always run in foreground — all output streams directly to terminal so the orchestrator can read it and report at Step 9.
 
 ### Windows (native PowerShell — no Git Bash / WSL)
 
