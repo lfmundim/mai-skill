@@ -5,20 +5,24 @@
     MAI delegate runner for Windows — PowerShell port of copilot-delegate.
 
 .DESCRIPTION
-    Runs GitHub Copilot CLI in programmatic mode, streams output live (polled every
-    150ms via Start-Job), captures AIC cost via OTel, runs post-execution syntax
-    checks, and appends a JSON run log entry — identical behaviour to the bash version.
+    Runs GitHub Copilot CLI in programmatic mode, streams output live via async
+    Process events, captures AIC cost via OTel, runs post-execution syntax checks,
+    and appends a JSON run log entry — identical behaviour to the bash version.
 
     Key Windows differences vs the bash version:
-      - Uses Start-Job for process isolation + timeout (no 'timeout' command on Windows)
+      - Uses System.Diagnostics.Process + async OutputDataReceived events for streaming
+        and timeout (Start-Job caused copilot to detect no TTY and stall)
+      - Writes a temp runner .ps1 so copilot is invoked via & inside a real PS child
+        process — avoids all command-line argument escaping issues for complex prompts
+      - Prints a heartbeat line every 30s so long-running tasks don't look hung
       - Uses [DateTime]::UtcNow.Ticks for high-precision timing (avoids 'date +%s%N')
       - Detects 'python3' then 'python' — Windows installers often register as 'python'
       - Temp/log paths use $HOME (e.g. C:\Users\you) — consistent with Git Bash paths
 
     PROMPT SAFETY:
-      Prompt is written to a UTF-8 temp file before the job starts. Inside the job,
-      PowerShell's & operator reads it and passes the content as a single argument,
-      correctly quoting braces, quotes, Unicode, emoji, and other special characters.
+      Prompt is written to a UTF-8 temp file. The runner script reads it via
+      [IO.File]::ReadAllText and passes it to copilot -p via PowerShell's & operator,
+      which handles braces, quotes, Unicode, emoji, and other special characters.
 
     VERSION CHECK:
       Stores copilot CLI version in ~/.local/share/copilot-delegate-cli-version and
@@ -148,14 +152,27 @@ Write-Host "Timeout : ${TimeoutSecs}s"
 Write-Host "Prompt  : $($Prompt.Substring(0, [Math]::Min(120, $Prompt.Length)))..."
 Write-Host "=========================="
 
-# ── Helper: run copilot in a job, stream output, enforce timeout ───────────────
+# ── Helper: run copilot as a real child process, stream output, enforce timeout ─
 #
-# Start-Job creates a child PowerShell process. We poll Receive-Job every 150ms
-# to approximate live streaming. The job emits all output lines as strings, then
-# a sentinel "##MAI-EXITCODE:N##" as the very last item so we can recover $LASTEXITCODE
-# (which does not survive across process boundaries in a regular & invocation).
+# WHY NOT Start-Job:
+#   Start-Job creates a background PowerShell process with no console attached.
+#   The Copilot CLI detects the missing TTY and either buffers all output until
+#   exit or stalls waiting for interactive input — both look like a hang to the user.
 #
-# AllowFlags controls --allow-tool vs --allow-all-tools (used on retry).
+# HOW THIS WORKS:
+#   1. A temp runner .ps1 is written containing the copilot invocation. This
+#      sidesteps all ProcessStartInfo.Arguments escaping headaches — paths and
+#      model names are embedded with PS single-quote escaping; the prompt content
+#      is read from $PFile at runtime by the runner via [IO.File]::ReadAllText.
+#   2. System.Diagnostics.Process launches powershell.exe -File <runner> with
+#      stdout/stderr redirected and async OutputDataReceived events enabled.
+#      WaitForExit(150ms) loops until done or timeout.
+#   3. [Console]::WriteLine in the event handler is thread-safe — output appears
+#      immediately as copilot emits it, no polling lag.
+#   4. A heartbeat line prints every 30s during long silent runs ("Copilot still
+#      running… Ns elapsed") so users can distinguish "working" from "hung".
+#
+# AllowFlags controls --allow-tool vs --allow-all-tools (used on the gpt-5-mini retry).
 function Invoke-CopilotWithTimeout {
     param(
         [string]$WDir,
@@ -166,41 +183,106 @@ function Invoke-CopilotWithTimeout {
         [string[]]$AllowFlags = @('--allow-tool=write,shell')
     )
 
-    $job = Start-Job -ScriptBlock {
-        param($wdir, $pfile, $mdl, $otel, $allowFlags)
-        $env:COPILOT_OTEL_FILE_EXPORTER_PATH = $otel
-        Set-Location $wdir
-        # Read from file — the & operator correctly passes the content as one argument,
-        # handling newlines, braces, quotes, emoji, and other tricky characters.
-        $promptContent = [IO.File]::ReadAllText($pfile, [Text.Encoding]::UTF8)
-        & copilot -p $promptContent --model $mdl @allowFlags --yolo 2>&1
-        # Sentinel lets the parent recover the real exit code
-        "##MAI-EXITCODE:$LASTEXITCODE##"
-    } -ArgumentList $WDir, $PFile, $Mdl, $Otel, (, $AllowFlags)
+    # Escape single quotes in path values so they embed safely in the runner script.
+    # Windows paths never contain single quotes normally, but guard anyway.
+    $safeWDir  = $WDir  -replace "'", "''"
+    $safePFile = $PFile -replace "'", "''"
+    $safeMdl   = $Mdl   -replace "'", "''"
+    $safeOtel  = $Otel  -replace "'", "''"
+    $allowStr  = $AllowFlags -join ' '
 
-    $sw          = [Diagnostics.Stopwatch]::StartNew()
-    $timedOut    = $false
-    $lines       = [Collections.Generic.List[string]]::new()
-    $exitCode    = 0
+    # The runner script: runs copilot inside a real PS child process so copilot
+    # inherits a proper parent context and does not detect a missing console.
+    $runnerBody = @"
+`$ErrorActionPreference = 'Continue'
+`$env:COPILOT_OTEL_FILE_EXPORTER_PATH = '$safeOtel'
+Set-Location '$safeWDir'
+`$p = [IO.File]::ReadAllText('$safePFile', [Text.Encoding]::UTF8)
+& copilot -p `$p --model '$safeMdl' $allowStr --yolo 2>&1
+exit `$LASTEXITCODE
+"@
+    $runnerFile = [IO.Path]::GetTempFileName() + '.ps1'
+    [IO.File]::WriteAllText($runnerFile, $runnerBody, [Text.Encoding]::UTF8)
 
-    # Poll while running — gives ~150ms latency vs true real-time streaming
-    while ($job.State -eq 'Running') {
-        foreach ($item in @(Receive-Job $job -ErrorAction SilentlyContinue)) {
-            $s = [string]$item
-            if ($s -match '^##MAI-EXITCODE:(-?\d+)##$') { $exitCode = [int]$Matches[1] }
-            else { Write-Host $s; $lines.Add($s) }
+    # Pick the right PS executable (pwsh for PS 7+, powershell for PS 5.1)
+    $psExe = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh' } else { 'powershell' }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $psExe
+    $psi.Arguments              = "-NoProfile -ExecutionPolicy Bypass -File `"$runnerFile`""
+    $psi.UseShellExecute        = $false   # required for output redirection
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $false   # inherit parent console so ANSI colours work
+
+    # ConcurrentQueue preserves insertion order (ConcurrentBag does not)
+    $outputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+    $outId = "MAI-Out-$(Get-Random)"
+    $errId = "MAI-Err-$(Get-Random)"
+
+    # Event handler — called from the async output thread.
+    # [Console]::WriteLine is thread-safe; writing directly to stdout bypasses
+    # PS's output buffering so lines appear immediately.
+    $handler = {
+        $data = $EventArgs.Data
+        if ($null -ne $data) {
+            [Console]::WriteLine($data)
+            $Event.MessageData.Enqueue($data)
         }
-        if ($sw.Elapsed.TotalSeconds -ge $Secs) { Stop-Job $job; $timedOut = $true; $exitCode = 124; break }
-        Start-Sleep -Milliseconds 150
     }
 
-    # Drain any remaining buffered output after job finishes
-    foreach ($item in @(Receive-Job $job -Wait -ErrorAction SilentlyContinue)) {
-        $s = [string]$item
-        if ($s -match '^##MAI-EXITCODE:(-?\d+)##$') { $exitCode = [int]$Matches[1] }
-        else { Write-Host $s; $lines.Add($s) }
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+
+    Register-ObjectEvent -InputObject $proc -EventName 'OutputDataReceived' `
+        -SourceIdentifier $outId -Action $handler -MessageData $outputQueue | Out-Null
+    Register-ObjectEvent -InputObject $proc -EventName 'ErrorDataReceived' `
+        -SourceIdentifier $errId -Action $handler -MessageData $outputQueue | Out-Null
+
+    $proc.Start() | Out-Null
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+
+    $sw       = [Diagnostics.Stopwatch]::StartNew()
+    $timedOut = $false
+    $lastBeat = -1
+
+    # Loop: WaitForExit(150ms) returns $false when still running, $true when done.
+    while (-not $proc.WaitForExit(150)) {
+        $elapsed = [int]$sw.Elapsed.TotalSeconds
+        if ($elapsed -ge $Secs) {
+            try { $proc.Kill() } catch {}
+            $timedOut = $true
+            break
+        }
+        # Heartbeat every 30s — distinguishes "copilot working silently" from "frozen"
+        $beat = [Math]::Floor($elapsed / 30)
+        if ($elapsed -ge 30 -and $beat -ne $lastBeat) {
+            $lastBeat = $beat
+            [Console]::WriteLine("[wait] Copilot still running... (${elapsed}s elapsed, timeout ${Secs}s)")
+        }
     }
-    Remove-Job $job -Force
+
+    # Second WaitForExit() with no timeout ensures all async output callbacks finish.
+    # This is the standard .NET pattern for Process + BeginOutputReadLine.
+    $proc.WaitForExit()
+    Start-Sleep -Milliseconds 200   # final drain window for event handlers
+
+    $exitCode = if ($timedOut) { 124 } else { $proc.ExitCode }
+
+    # Clean up event subscriptions and temp runner
+    Unregister-Event -SourceIdentifier $outId -ErrorAction SilentlyContinue
+    Unregister-Event -SourceIdentifier $errId -ErrorAction SilentlyContinue
+    Get-Job | Where-Object { $_.Name -in @($outId, $errId) } |
+        Remove-Job -Force -ErrorAction SilentlyContinue
+    $proc.Dispose()
+    Remove-Item $runnerFile -ErrorAction SilentlyContinue
+
+    # Drain queue into an ordered list for pattern matching
+    $lines = [Collections.Generic.List[string]]::new()
+    $item  = $null
+    while ($outputQueue.TryDequeue([ref]$item)) { $lines.Add($item) }
 
     return @{ ExitCode = $exitCode; TimedOut = $timedOut; Output = $lines -join "`n" }
 }
