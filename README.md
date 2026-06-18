@@ -47,6 +47,17 @@ User: /mai add rate limiting to POST /auth --with-review 2
 
 ## Installation
 
+Installer scripts are provided at the repo root for both platforms:
+
+| Script | Platform | Notes |
+|---|---|---|
+| `install.sh` / `uninstall.sh` | Unix, macOS, WSL | `chmod +x` then run |
+| `install.ps1` / `uninstall.ps1` | Windows PowerShell | Requires **Developer Mode** or an **elevated (Admin) terminal** for symlink creation |
+
+Both approaches are equivalent — the scripts below show the manual steps for reference.
+
+### Unix (WSL, Linux, macOS)
+
 ```bash
 # 1. Clone this repo
 git clone https://github.com/<your-org>/mai-skill.git
@@ -74,6 +85,54 @@ done
 ```
 
 Verify with:
+```bash
+~/tools/copilot-delegate /tmp "Say hello in one sentence." gpt-5-mini 30
+```
+
+### Windows (PowerShell)
+
+> **Note:** `copilot-delegate` is a bash script. It runs under **Git Bash** or **WSL** —
+> not native PowerShell. The steps below set up the files; execution still goes through bash.
+> Symlinks on Windows require **Developer Mode** or an elevated (admin) terminal.
+
+```powershell
+# 1. Clone this repo
+git clone https://github.com/<your-org>/mai-skill.git
+Set-Location mai-skill
+$REPO = (Get-Location).Path
+
+# 2. Install the delegate scripts
+New-Item -ItemType Directory -Force "$HOME\tools" | Out-Null
+New-Item -ItemType SymbolicLink -Force -Path "$HOME\tools\copilot-delegate"     -Target "$REPO\tools\copilot-delegate"
+New-Item -ItemType SymbolicLink -Force -Path "$HOME\tools\log-review-summary"   -Target "$REPO\tools\log-review-summary"
+
+# 3. Install skills for Copilot CLI and Claude Code
+$skills = [ordered]@{
+  "mai"             = "SKILL.md"
+  "maion"           = "MAION.md"
+  "maioff"          = "MAIOFF.md"
+  "maistatus"       = "MAISTATUS.md"
+  "mai-report"      = "MAI-REPORT.md"
+  "mai-model-pick"  = "MAI-MODEL-PICK.md"
+  "mai-model-clear" = "MAI-MODEL-CLEAR.md"
+}
+
+foreach ($skill in $skills.Keys) {
+  $src = $skills[$skill]
+  foreach ($base in "$HOME\.copilot\skills", "$HOME\.claude\skills") {
+    $dir = "$base\$skill"
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    New-Item -ItemType SymbolicLink -Force -Path "$dir\SKILL.md" -Target "$REPO\$src"
+  }
+}
+```
+
+Verify with Git Bash:
+```bash
+~/tools/copilot-delegate "$TEMP" "Say hello in one sentence." gpt-5-mini 30
+```
+
+Or with WSL (if your repo is in WSL's filesystem):
 ```bash
 ~/tools/copilot-delegate /tmp "Say hello in one sentence." gpt-5-mini 30
 ```
