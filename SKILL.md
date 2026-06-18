@@ -217,16 +217,13 @@ directly into bash heredocs yourself.
 
 ## Step 6 — Launch the delegate
 
+**Detect the platform first, then use the matching invocation below.**
+
+### Unix / macOS / WSL / Git Bash
+
 ```bash
 ~/tools/copilot-delegate "<workdir>" "<prompt>" "<model>" [timeout-secs]
 ```
-
-| Argument | Default | Notes |
-|---|---|---|
-| `workdir` | — | Absolute path, must exist |
-| `prompt` | — | Self-contained task description |
-| `model` | — | Always explicit — use EXECUTOR_MODEL from Step 3 |
-| `timeout-secs` | `300` | Wall-clock kill timer |
 
 **Example:**
 ```bash
@@ -238,6 +235,24 @@ directly into bash heredocs yourself.
 ~/tools/copilot-delegate "/path/to/project" "<prompt>" "gpt-5-mini" > /tmp/mai_out.txt 2>&1 &
 # Monitor with: tail -f /tmp/mai_out.txt
 ```
+
+### Windows (native PowerShell — no Git Bash / WSL)
+
+```powershell
+& "$HOME\tools\copilot-delegate.ps1" -Workdir "<workdir>" -Prompt "<prompt>" -Model "<model>" -TimeoutSecs <secs>
+```
+
+**Example:**
+```powershell
+& "$HOME\tools\copilot-delegate.ps1" -Workdir "C:\projects\myapp" -Prompt "Stack: Python/Flask. File: app.py`n`nTASK: Add rate limiting..." -Model "gpt-5-mini" -TimeoutSecs 300
+```
+
+| Argument | Default | Notes |
+|---|---|---|
+| `workdir` (both) | — | Absolute path, must exist |
+| `prompt` (both) | — | Self-contained task description |
+| `model` (both) | — | Always explicit — use EXECUTOR_MODEL from Step 3 |
+| `timeout-secs` / `-TimeoutSecs` | `300` | Wall-clock kill timer |
 
 ---
 
@@ -310,7 +325,9 @@ issues_fixed    = 0
    - If exit 0 and issue resolved: `issues_fixed += 1`
    - Continue to next iteration
 
-6. After the loop, call the review logger:
+6. After the loop, call the review logger.
+
+Unix / Git Bash:
 ```bash
 python3 ~/tools/log-review-summary \
   --workdir "$WORKDIR" \
@@ -319,6 +336,14 @@ python3 ~/tools/log-review-summary \
   --found "$issues_found" \
   --fixed "$issues_fixed" \
   --remaining "$((issues_found - issues_fixed))"
+```
+
+Windows (PowerShell):
+```powershell
+$remaining = $issues_found - $issues_fixed
+& python "$HOME\tools\log-review-summary" `
+  --workdir $WORKDIR --allowed $review_allowed --used $review_used `
+  --found $issues_found --fixed $issues_fixed --remaining $remaining
 ```
 
 ---

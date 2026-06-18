@@ -68,7 +68,14 @@ fi
 MODEL_FALLBACK="${DELEGATE_MODEL_FALLBACK:-false}"
 
 cd "$WORKDIR"
-START_NS=$(date +%s%N)
+# date +%s%N (nanoseconds) is GNU-only. macOS and Windows Git Bash lack it.
+# Fall back to seconds-only precision when %N returns the literal string "N".
+_raw_ns=$(date +%s%N 2>/dev/null)
+if echo "$_raw_ns" | grep -q 'N$'; then
+  START_NS=$(date +%s)000000000   # seconds → nanoseconds
+else
+  START_NS="$_raw_ns"
+fi
 GIT_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "no-git")
 FILES_BEFORE=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 
@@ -96,11 +103,23 @@ printf '%s' "$PROMPT" > "$PROMPT_FILE"
 # ── Run Copilot CLI ────────────────────────────────────────────────────────────
 # Streams output live while also capturing it for post-run policy detection.
 # No pseudo-TTY needed — Copilot CLI works without one in programmatic mode.
-timeout "$TIMEOUT_SECS" copilot -p "$(cat "$PROMPT_FILE")" \
-  --model "$MODEL" \
-  --allow-tool='write,shell' \
-  --yolo \
-  2>&1 | tee "$OUTPUT_FILE"
+#
+# 'timeout' is not available in Windows Git Bash (it ships in GNU coreutils but
+# Git for Windows omits it). Fall back to running without a kill wrapper — the
+# Copilot CLI has its own internal timeout, so tasks won't hang indefinitely.
+if command -v timeout >/dev/null 2>&1; then
+  timeout "$TIMEOUT_SECS" copilot -p "$(cat "$PROMPT_FILE")" \
+    --model "$MODEL" \
+    --allow-tool='write,shell' \
+    --yolo \
+    2>&1 | tee "$OUTPUT_FILE"
+else
+  copilot -p "$(cat "$PROMPT_FILE")" \
+    --model "$MODEL" \
+    --allow-tool='write,shell' \
+    --yolo \
+    2>&1 | tee "$OUTPUT_FILE"
+fi
 COPILOT_EXIT=${PIPESTATUS[0]}
 
 # ── Model-not-found cascade ───────────────────────────────────────────────────
@@ -112,11 +131,19 @@ if grep -qiE "$MODEL_NOT_FOUND_PATTERN" "$OUTPUT_FILE" 2>/dev/null; then
     MODEL="gpt-5-mini"
     MODEL_FALLBACK=true
     > "$OUTPUT_FILE"
-    timeout "$TIMEOUT_SECS" copilot -p "$(cat "$PROMPT_FILE")" \
-      --model "$MODEL" \
-      --allow-all-tools \
-      --yolo \
-      2>&1 | tee "$OUTPUT_FILE"
+    if command -v timeout >/dev/null 2>&1; then
+      timeout "$TIMEOUT_SECS" copilot -p "$(cat "$PROMPT_FILE")" \
+        --model "$MODEL" \
+        --allow-all-tools \
+        --yolo \
+        2>&1 | tee "$OUTPUT_FILE"
+    else
+      copilot -p "$(cat "$PROMPT_FILE")" \
+        --model "$MODEL" \
+        --allow-all-tools \
+        --yolo \
+        2>&1 | tee "$OUTPUT_FILE"
+    fi
     COPILOT_EXIT=${PIPESTATUS[0]}
     if grep -qiE "$MODEL_NOT_FOUND_PATTERN" "$OUTPUT_FILE" 2>/dev/null; then
       echo ""
@@ -235,7 +262,12 @@ else
 fi
 
 # ── AIC report + run log (via OTel) ──────────────────────────────────────────
-END_NS=$(date +%s%N)
+_raw_end_ns=$(date +%s%N 2>/dev/null)
+if echo "$_raw_end_ns" | grep -q 'N$'; then
+  END_NS=$(date +%s)000000000
+else
+  END_NS="$_raw_end_ns"
+fi
 FILES_CHANGED_COUNT=$(printf '%s\n' "$CHANGED" | grep -c '[^[:space:]]' 2>/dev/null)
 FILES_CHANGED_COUNT=${FILES_CHANGED_COUNT:-0}
 TOTAL_ERRORS=${TOTAL_ERRORS:-0}

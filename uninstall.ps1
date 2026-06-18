@@ -93,6 +93,8 @@ Write-Host "[ 2/3 ] Removing `$HOME\tools symlinks ..."
 Write-Host ""
 
 Remove-Symlink -Path "$HOME\tools\copilot-delegate"
+Remove-Symlink -Path "$HOME\tools\copilot-delegate.ps1"
+Remove-Symlink -Path "$HOME\tools\copilot-delegate.bat"
 Remove-Symlink -Path "$HOME\tools\log-review-summary"
 
 Write-Host ""

@@ -39,9 +39,19 @@ User: /mai add rate limiting to POST /auth --with-review 2
 - [GitHub Copilot CLI](https://githubnext.com/projects/copilot-cli/) installed and authenticated
   (`copilot --version`)
 - Claude Code or a Copilot agent with skills enabled
-- `python3` available (syntax checks + OTel parsing)
+- `python3` (or `python` on Windows) available — syntax checks + OTel parsing
 - `git` repository to work in
 - `node`, `cargo`, `dotnet`, `swiftc` available for per-language syntax checks (optional)
+
+### Windows-specific notes
+
+| File | Purpose |
+|---|---|
+| `tools/copilot-delegate.ps1` | Native PowerShell port — no Git Bash or WSL required |
+| `tools/copilot-delegate.bat` | Shim that forwards to `.ps1`; lets the orchestrator call `copilot-delegate` (no extension) from cmd.exe or PowerShell |
+| `tools/copilot-delegate` | Original bash version — still used in Git Bash / WSL |
+
+The SKILL.md orchestrator detects the platform and calls the correct variant automatically.
 
 ---
 

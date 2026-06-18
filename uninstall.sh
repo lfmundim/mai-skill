@@ -68,6 +68,7 @@ echo "[ 2/3 ] Removing ~/tools symlinks ..."
 echo ""
 
 remove_symlink "$HOME/tools/copilot-delegate"
+remove_symlink "$HOME/tools/copilot-delegate.ps1"
 remove_symlink "$HOME/tools/log-review-summary"
 
 echo ""

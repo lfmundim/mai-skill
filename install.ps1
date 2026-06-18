@@ -85,11 +85,18 @@ Write-Host ""
 
 New-Item -ItemType Directory -Force "$HOME\tools" | Out-Null
 
-# The delegate runner — bash script called for every /mai invocation
-New-Symlink -Path "$HOME\tools\copilot-delegate"   -Target "$RepoDir\tools\copilot-delegate"
+# Bash delegate (used by Git Bash / WSL users)
+New-Symlink -Path "$HOME\tools\copilot-delegate"      -Target "$RepoDir\tools\copilot-delegate"
+
+# PowerShell delegate — native Windows port, used when there is no Git Bash / WSL
+New-Symlink -Path "$HOME\tools\copilot-delegate.ps1"  -Target "$RepoDir\tools\copilot-delegate.ps1"
+
+# .bat shim — lets the orchestrator call '~/tools/copilot-delegate' (no extension)
+# on Windows; cmd.exe and PowerShell resolve .bat before .ps1 via PATHEXT
+New-Symlink -Path "$HOME\tools\copilot-delegate.bat"  -Target "$RepoDir\tools\copilot-delegate.bat"
 
 # The review-summary logger — used by the --with-review loop
-New-Symlink -Path "$HOME\tools\log-review-summary" -Target "$RepoDir\tools\log-review-summary"
+New-Symlink -Path "$HOME\tools\log-review-summary"    -Target "$RepoDir\tools\log-review-summary"
 
 Write-Host ""
 

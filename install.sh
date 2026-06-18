@@ -32,15 +32,20 @@ echo "[ 1/3 ] Setting up ~/tools ..."
 
 mkdir -p "$HOME/tools"
 
-# Symlink the delegate runner — this is what SKILL.md calls for every /mai run
-ln -sf "$REPO_DIR/tools/copilot-delegate"    "$HOME/tools/copilot-delegate"
+# Symlink the bash delegate runner — used by Unix/macOS/WSL/Git Bash
+ln -sf "$REPO_DIR/tools/copilot-delegate"     "$HOME/tools/copilot-delegate"
 echo "        → ~/tools/copilot-delegate"
 
+# Symlink the PowerShell delegate — Windows users without Git Bash use this
+# (also useful if you run pwsh on Linux/macOS)
+ln -sf "$REPO_DIR/tools/copilot-delegate.ps1" "$HOME/tools/copilot-delegate.ps1"
+echo "        → ~/tools/copilot-delegate.ps1"
+
 # Symlink the review-summary logger — used by the --with-review loop
-ln -sf "$REPO_DIR/tools/log-review-summary"  "$HOME/tools/log-review-summary"
+ln -sf "$REPO_DIR/tools/log-review-summary"   "$HOME/tools/log-review-summary"
 echo "        → ~/tools/log-review-summary"
 
-# Mark both as executable (symlinks inherit, but the originals need the bit)
+# Mark executables (symlinks inherit, but the originals need the bit)
 chmod +x "$REPO_DIR/tools/copilot-delegate"
 chmod +x "$REPO_DIR/tools/log-review-summary"
 echo "        chmod +x applied to originals"
