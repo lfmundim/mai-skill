@@ -463,8 +463,8 @@ $env:DELEGATE_MODEL            = $Model
 $env:DELEGATE_MODEL_FALLBACK   = [string]$modelFallback
 $env:DELEGATE_FILES_CHANGED    = [string]$filesChanged
 $env:DELEGATE_SYNTAX_ERRORS    = [string]$syntaxErrors
-$env:DELEGATE_START_NS         = [string]$startNs
-$env:DELEGATE_END_NS           = [string]$endNs
+$env:DELEGATE_START_NS         = $startNs.ToString('D')
+$env:DELEGATE_END_NS           = $endNs.ToString('D')
 $env:DELEGATE_OTEL_FILE        = $otelFile
 $env:VERBOSE                   = if ($isVerbose) { 'true' } else { 'false' }
 
@@ -477,8 +477,8 @@ LOG     = Path.home() / '.local' / 'share' / 'delegate-runs.jsonl'
 LOG.parent.mkdir(parents=True, exist_ok=True)
 verbose = os.environ.get('VERBOSE', 'false').lower() == 'true'
 
-start_ns = int(os.environ.get('DELEGATE_START_NS', 0) or 0)
-end_ns   = int(os.environ.get('DELEGATE_END_NS',   0) or 0)
+start_ns = int(float(os.environ.get('DELEGATE_START_NS', 0) or 0))
+end_ns   = int(float(os.environ.get('DELEGATE_END_NS',   0) or 0))
 duration = round((end_ns - start_ns) / 1e9, 1) if start_ns and end_ns else 0
 
 exit_code     = int(os.environ.get('DELEGATE_EXIT', 0) or 0)
