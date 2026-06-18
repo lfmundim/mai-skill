@@ -120,7 +120,7 @@ if ($currentVersion) { [IO.File]::WriteAllText($versionFile, $currentVersion) }
 # ── Timing — .NET Ticks are 100-nanosecond units ─────────────────────────────
 # Multiply by 100 to get nanoseconds, matching bash's 'date +%s%N' precision.
 # Only the DELTA matters (duration), so the epoch base is irrelevant.
-$startNs = [DateTime]::UtcNow.Ticks * 100
+$startNs = [DateTime]::UtcNow.Ticks * 100L
 
 # ── Capture git state before delegate runs ────────────────────────────────────
 Push-Location $Workdir
@@ -180,7 +180,7 @@ function Invoke-CopilotWithTimeout {
         [string]$Mdl,
         [string]$Otel,
         [int]$Secs,
-        [string[]]$AllowFlags = @('--allow-tool=write,shell')
+        [string[]]$AllowFlags = @('--allow-all-tools')
     )
 
     # Escape single quotes in path values so they embed safely in the runner script.
@@ -451,7 +451,7 @@ if ($gitBefore -ne 'no-git' -and $gitAfter -ne 'no-git' -and $gitBefore -ne $git
 Pop-Location
 
 # ── AIC report + run log via Python ───────────────────────────────────────────
-$endNs          = [DateTime]::UtcNow.Ticks * 100
+$endNs          = [DateTime]::UtcNow.Ticks * 100L
 $filesChanged   = ($changedFiles | Measure-Object).Count
 $isVerbose      = $VerboseOutput.IsPresent
 
